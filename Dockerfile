@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file
@@ -13,6 +14,12 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Create model directory
+RUN mkdir -p /app/models
+
+# Environment variables
+ENV MODEL_PATH=/app/models
 
 # Copy application code
 COPY . .
