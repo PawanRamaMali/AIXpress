@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import logging
 import os
+import shutil
 from typing import List, Optional
 
 # Setup logging
@@ -26,12 +27,12 @@ class QueryResponse(BaseModel):
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
+model_path = os.environ.get("MODEL_PATH", "/app/models")
 
 # Load model on startup and release on shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load the model and tokenizer on startup
-    load_llm()
+    # Check if model exists locally, if not use a default model
     yield
     # Release resources on shutdown
     if torch.cuda.is_available():
@@ -40,48 +41,107 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
 
-def load_llm():
-    """Load the Llama 3.2 model and tokenizer"""
+def load_model_from_path(model_path):
+    """Load a model from a local path"""
     global model, tokenizer
     
     try:
-        logger.info("Loading Llama 3.2 model and tokenizer...")
-        
-        # You can replace with the specific Llama 3.2 model you want to use
-        model_id = "meta-llama/Meta-Llama-3.2-8B"
+        logger.info(f"Loading model and tokenizer from {model_path}...")
         
         # Check for CUDA availability
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
         
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         
         # Load model with optimizations if on CUDA
         if device == "cuda":
             model = AutoModelForCausalLM.from_pretrained(
-                model_id,
+                model_path,
                 torch_dtype=torch.bfloat16,  # Use mixed precision
                 device_map="auto",           # Automatically determine device mapping
-                low_cpu_mem_usage=True       # Optimize for low CPU memory
+                low_cpu_mem_usage=True,      # Optimize for low CPU memory
+                local_files_only=True
             )
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True)
             model.to(device)
             
         logger.info("Model loaded successfully!")
+        return True
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
-        raise RuntimeError(f"Failed to load model: {str(e)}")
+        return False
+
+def try_load_default_model():
+    """Try to load a small default model if no custom model is available"""
+    global model, tokenizer
+    
+    try:
+        logger.info("Loading a small default model...")
+        # Use a small open-source model that doesn't require authentication
+        model_id = "gpt2"  # Small model that's freely available
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model.to(device)
+        
+        logger.info("Default model loaded successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"Error loading default model: {str(e)}")
+        return False
 
 @app.get("/")
 async def root():
-    return {"message": "Llama 3.2 API is running. Send POST requests to /generate."}
+    return {"message": "LLM API is running. Send POST requests to /generate."}
+
+@app.post("/load_model")
+async def load_model(model_directory: str = Body(..., embed=True)):
+    """Load a model from a specified directory path"""
+    if not os.path.exists(model_directory):
+        raise HTTPException(status_code=404, detail=f"Model directory not found: {model_directory}")
+    
+    success = load_model_from_path(model_directory)
+    if success:
+        return {"status": "success", "message": f"Model loaded from {model_directory}"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to load model")
+
+@app.post("/upload_model")
+async def upload_model(file: UploadFile = File(...)):
+    """Upload a model file (for small models or model files)"""
+    # Create models directory if it doesn't exist
+    os.makedirs(model_path, exist_ok=True)
+    
+    # Save the uploaded file
+    file_path = os.path.join(model_path, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    return {"status": "success", "message": f"Model file uploaded to {file_path}"}
 
 @app.post("/generate", response_model=QueryResponse)
 async def generate_text(request: QueryRequest = Body(...)):
+    global model, tokenizer
+    
+    # Try to load a model if none is loaded
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
+        model_loaded = False
+        
+        # First try to load from the configured model path
+        if os.path.exists(model_path):
+            model_loaded = load_model_from_path(model_path)
+        
+        # If that fails, try to load a default model
+        if not model_loaded:
+            model_loaded = try_load_default_model()
+            
+        if not model_loaded:
+            raise HTTPException(status_code=503, detail="No model is loaded and couldn't load a default model")
     
     try:
         # Prepare the inputs
@@ -133,12 +193,21 @@ async def generate_text(request: QueryRequest = Body(...)):
         logger.error(f"Error generating text: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating text: {str(e)}")
 
+@app.get("/models")
+async def list_models():
+    """List all available models in the model directory"""
+    if not os.path.exists(model_path):
+        return {"models": []}
+    
+    models = [d for d in os.listdir(model_path) if os.path.isdir(os.path.join(model_path, d))]
+    return {"models": models}
+
 # Add health check endpoint
 @app.get("/health")
 async def health_check():
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "healthy", "model": "Llama 3.2", "device": next(model.parameters()).device.type}
+        return {"status": "no model loaded", "device": "unknown"}
+    return {"status": "healthy", "device": next(model.parameters()).device.type}
 
 if __name__ == "__main__":
     import uvicorn
